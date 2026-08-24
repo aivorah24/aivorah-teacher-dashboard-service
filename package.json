@@ -1,0 +1,28 @@
+{
+  "name": "aivorah-teacher-dashboard-service",
+  "version": "1.0.0",
+  "description": "Aivorah Teacher Dashboard — standalone microservice for the 3 teacher-dashboard aggregation endpoints (student list, insights, recent activity), extracted from the ai-mentor monolith's routes/student.js",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.9.0",
+    "@supabase/supabase-js": "^2.100.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.14",
+    "supertest": "^6.3.4"
+  },
+  "jest": {
+    "setupFiles": [
+      "<rootDir>/jest.setup.js"
+    ]
+  }
+}
