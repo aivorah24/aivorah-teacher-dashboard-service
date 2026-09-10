@@ -87,6 +87,35 @@ describe('GET /student/by-teacher/:teacherId', () => {
     expect(res.body[0].completedTopics).toEqual(['Fractions']);
   });
 
+  // Student Progress work-order (2026-08-29): Activity & Performance table's
+  // Quiz columns — real attempt count + best score, not fabricated.
+  test('quizAttempts/quizBestScore reflect the real topic_attempts history for that student', async () => {
+    mockSb.setTable('teacher_student', { data: [linkRow()], error: null });
+    mockSb.setTable('student_stats', { data: [{ student_id: S1, completed_topics: [] }], error: null });
+    mockSb.setTable('topic_attempts', {
+      data: [
+        { student_id: S1, topic: 'Fractions', subject: 'Mathematics', passed: false, score: 40 },
+        { student_id: S1, topic: 'Fractions', subject: 'Mathematics', passed: true, score: 85 },
+      ],
+      error: null,
+    });
+
+    const res = await request(app).get(`/student/by-teacher/${TEACHER_UUID}`);
+
+    expect(res.body[0].quizAttempts).toBe(2);
+    expect(res.body[0].quizBestScore).toBe(85);
+  });
+
+  test('a student with zero quiz attempts gets quizAttempts=0 and quizBestScore=null, not a crash', async () => {
+    mockSb.setTable('teacher_student', { data: [linkRow()], error: null });
+    mockSb.setTable('student_stats', { data: [{ student_id: S1, completed_topics: [] }], error: null });
+
+    const res = await request(app).get(`/student/by-teacher/${TEACHER_UUID}`);
+
+    expect(res.body[0].quizAttempts).toBe(0);
+    expect(res.body[0].quizBestScore).toBeNull();
+  });
+
   test('deduplicates a student linked under multiple subjects into a single row', async () => {
     mockSb.setTable('teacher_student', {
       data: [linkRow({ }), { student_id: S1, subject: 'Mathematics', users: userRow() }],
