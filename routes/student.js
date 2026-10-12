@@ -4,6 +4,7 @@ const supabase = require('../services/supabase');
 const { client: qdrant, resolveCollection } = require('../services/qdrant');
 const { normalizeCurriculum } = require('../utils/curriculum');
 const { computeTopicStatus } = require('../utils/topicStatus');
+const { computeStudentStatus } = require('../utils/studentStatus');
 
 // ── Helpers ────────────────────────────────────────────────
 // Ported verbatim from ai-mentor/server/routes/student.js (2026-08-24) —
@@ -471,29 +472,9 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
       const chall = challengeMap[link.student_id] || { assigned: 0, completed: 0 };
       const challPct = chall.assigned > 0 ? Math.round((chall.completed / chall.assigned) * 100) : 0;
 
-      // Deterministic "needs attention" — flagged solely by Learning Path progress
-      // < 20% (not inactivity, not streak, not Assignments/Challenges — those are
-      // tracked separately in their own columns/UI).
-      // When totalTopics is a known, non-zero denominator we use the real %; when
-      // it's unknown (e.g. Qdrant lookup miss for that curriculum/grade), fall back
-      // to "has completed zero topics" so the flag can't be silently defeated by a
-      // missing topic count.
-      //
-      // GRACE for freshly-added students: a student who has NEVER engaged (no
-      // last-active, no XP, no completed topics) and whose account is younger
-      // than NEW_STUDENT_GRACE_DAYS is NOT flagged — otherwise every student a
-      // teacher adds shows "Attention" the instant they're created, before they
-      // ever had a chance to log in. After the grace window a still-untouched
-      // account does surface (they genuinely need a nudge).
-      const NEW_STUDENT_GRACE_DAYS = 7;
       const hasStarted = Boolean(s.last_active_date) || (s.xp_points ?? 0) > 0 || topicsCount > 0;
-      const accountAgeDays = user.created_at
-        ? (Date.now() - new Date(user.created_at).getTime()) / 86400000
-        : 999;
-      const inNewGrace = !hasStarted && accountAgeDays < NEW_STUDENT_GRACE_DAYS;
-      const needsAttention = inNewGrace
-        ? false
-        : (totalTopics > 0 ? progressPct < 20 : topicsCount === 0);
+      const status = computeStudentStatus({ lastActive: s.last_active_date, createdAt: user.created_at, progressPct });
+      const needsAttention = status === 'needs_attention';
 
       return {
         id:             link.student_id,
@@ -532,6 +513,7 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
         progressPct,
         assignmentsDone: s.assignments_done ?? 0,
         lastActive:     s.last_active_date,
+        status,
         needsAttention,
         photoUrl:       user.photo_url ?? null,
         // Real quiz stats (Activity & Performance table's Quiz columns) —

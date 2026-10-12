@@ -4,8 +4,7 @@ jest.mock('../../services/supabase', () => mockSb.supabase);
 
 // Qdrant is only used for the "total topics for this curriculum/grade" count —
 // mock its scroll() to return zero points so totalTopics resolves to 0 and
-// tests can focus on the needsAttention/grace-period fallback logic (see
-// student.js: "when totalTopics is unknown, fall back to has-completed-zero-topics").
+// tests can focus on the status logic.
 jest.mock('../../services/qdrant', () => ({
   client: { scroll: jest.fn().mockResolvedValue({ points: [], next_page_offset: null }) },
   resolveCollection: () => ({ collection: 'fake', qdrantCurriculum: 'IB PYP', qdrantGrade: 'Grade 4' }),
@@ -51,7 +50,7 @@ describe('GET /student/by-teacher/:teacherId', () => {
     expect(res.body).toEqual([]);
   });
 
-  test('a long-standing student with zero completed topics is flagged needsAttention', async () => {
+  test('a never-logged-in student whose account is 7+ days old is Needs Attention', async () => {
     mockSb.setTable('teacher_student', { data: [linkRow({ created_at: '2020-01-01T00:00:00Z' })], error: null });
     mockSb.setTable('student_stats', { data: [{ student_id: S1, completed_topics: [] }], error: null });
 
@@ -59,10 +58,11 @@ describe('GET /student/by-teacher/:teacherId', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
+    expect(res.body[0].status).toBe('needs_attention');
     expect(res.body[0].needsAttention).toBe(true);
   });
 
-  test('a freshly-created student (within the 7-day grace window) is NOT flagged, even with zero topics', async () => {
+  test('a freshly-created student is Getting Started, not flagged', async () => {
     const twoDaysAgo = new Date(Date.now() - 2 * 86400000).toISOString();
     mockSb.setTable('teacher_student', { data: [linkRow({ created_at: twoDaysAgo })], error: null });
     mockSb.setTable('student_stats', { data: [{ student_id: S1, completed_topics: [] }], error: null });
@@ -70,19 +70,35 @@ describe('GET /student/by-teacher/:teacherId', () => {
     const res = await request(app).get(`/student/by-teacher/${TEACHER_UUID}`);
 
     expect(res.status).toBe(200);
+    expect(res.body[0].status).toBe('getting_started');
     expect(res.body[0].needsAttention).toBe(false);
   });
 
-  test('a student who has completed at least one topic is not flagged, even past the grace window', async () => {
+  test('a student who logged in on day 1 with 0% progress is Getting Started, not flagged (manual-test bug)', async () => {
+    const today = new Date().toISOString();
+    mockSb.setTable('teacher_student', { data: [linkRow({ created_at: today })], error: null });
+    mockSb.setTable('student_stats', {
+      data: [{ student_id: S1, completed_topics: [], last_active_date: today.slice(0, 10), xp_points: 10 }],
+      error: null,
+    });
+
+    const res = await request(app).get(`/student/by-teacher/${TEACHER_UUID}`);
+
+    expect(res.body[0].status).toBe('getting_started');
+    expect(res.body[0].needsAttention).toBe(false);
+  });
+
+  test('an established student active recently with low progress is Keep Going, not flagged', async () => {
     mockSb.setTable('teacher_student', { data: [linkRow({ created_at: '2020-01-01T00:00:00Z' })], error: null });
     mockSb.setTable('student_stats', {
-      data: [{ student_id: S1, completed_topics: ['Fractions'], xp_points: 50 }],
+      data: [{ student_id: S1, completed_topics: ['Fractions'], xp_points: 50, last_active_date: new Date().toISOString().slice(0, 10) }],
       error: null,
     });
 
     const res = await request(app).get(`/student/by-teacher/${TEACHER_UUID}`);
 
     expect(res.status).toBe(200);
+    expect(res.body[0].status).toBe('keep_going');
     expect(res.body[0].needsAttention).toBe(false);
     expect(res.body[0].completedTopics).toEqual(['Fractions']);
   });
