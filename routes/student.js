@@ -233,28 +233,38 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
     const rawId = req.params.teacherId;
     const teacherId = await resolveTeacherId(rawId);
 
-    const { data: links, error } = await supabase
-      .from('teacher_student')
-      .select('student_id, subject, users!teacher_student_student_id_fkey(id, name, email, grade, section, class, school, curriculum, photo_url, created_at)')
-      .eq('teacher_id', teacherId ?? rawId);
-
-    if (error) return res.status(500).json({ error: error.message });
-
     // The real source of "which subjects does this teacher teach" is the
     // admin-curated Staff Subject Mapping (StaffSubjectMappingScreen), stored as
     // teacher.user_preferences.data.teaches = [{ grade, curriculum, subjects[] }].
     // teacher_student.subject is a separate, mostly-unused field that in practice
     // holds the curriculum name, not a real subject — so it's only a fallback.
-    const { data: teacherUser } = await supabase.from('users').select('email').eq('id', teacherId ?? rawId).maybeSingle();
-    let teacherTeaches = [];
-    if (teacherUser?.email) {
+    async function loadTeacherTeaches() {
+      const { data: teacherUser } = await supabase.from('users').select('email').eq('id', teacherId ?? rawId).maybeSingle();
+      if (!teacherUser?.email) return [];
       const { data: teacherPrefs } = await supabase
         .from('user_preferences')
         .select('data')
         .eq('user_email', teacherUser.email)
         .maybeSingle();
-      teacherTeaches = teacherPrefs?.data?.teaches || [];
+      return teacherPrefs?.data?.teaches || [];
     }
+
+    // Speed: every query in this route used to run one after another (~10 round
+    // trips to Supabase at ~0.25-0.6s each from Render). Queries that only need
+    // the teacher id run together here; the per-student ones run together below.
+    const [{ data: links, error }, teacherTeaches, { data: teacherAssignments }] = await Promise.all([
+      supabase
+        .from('teacher_student')
+        .select('student_id, subject, users!teacher_student_student_id_fkey(id, name, email, grade, section, class, school, curriculum, photo_url, created_at)')
+        .eq('teacher_id', teacherId ?? rawId),
+      loadTeacherTeaches(),
+      supabase
+        .from('assignments')
+        .select('id, student_id, grade, curriculum')
+        .eq('created_by_id', teacherId ?? rawId),
+    ]);
+
+    if (error) return res.status(500).json({ error: error.message });
     // Resolve real subjects for a given grade+curriculum from the teaches mapping.
     function subjectsForGradeCurriculum(grade, curriculum) {
       const subjects = new Set();
@@ -294,10 +304,55 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
     const studentIds = uniqueLinks.map(l => l.student_id);
     if (studentIds.length === 0) return res.json([]);
 
-    const { data: stats } = await supabase
-      .from('student_stats')
-      .select('*')
-      .in('student_id', studentIds);
+    // Pre-fetch totalTopics once per unique curriculum+grade(+subject) combo — avoids
+    // N Qdrant queries. Includes one combo per teacher-scoped subject per student.
+    const combos = new Set();
+    uniqueLinks.forEach(l => {
+      const curriculum = l.users?.curriculum ?? '';
+      const grade = l.users?.grade ?? '';
+      const subjects = teacherSubjectsByStudent[l.student_id];
+      if (subjects && subjects.size > 0) {
+        subjects.forEach(subj => combos.add(`${curriculum}|${grade}|${subj}`));
+      } else {
+        combos.add(`${curriculum}|${grade}|`);
+      }
+    });
+    const topicsCache = {};
+
+    // All per-student lookups (and the Qdrant topic counts) at once — each only
+    // needs studentIds.
+    const [
+      { data: stats },
+      { data: allAttempts },
+      { data: subjectTimeRows },
+      { data: subs },
+      { data: challengeAssigns },
+    ] = await Promise.all([
+      supabase
+        .from('student_stats')
+        .select('*')
+        .in('student_id', studentIds),
+      supabase
+        .from('topic_attempts')
+        .select('student_id, topic, subject, passed, score')
+        .in('student_id', studentIds),
+      supabase
+        .from('student_subject_time')
+        .select('student_id, subject, minutes, today_minutes, today_date')
+        .in('student_id', studentIds),
+      supabase
+        .from('assignment_submissions')
+        .select('student_id, assignment_id')
+        .in('student_id', studentIds),
+      supabase
+        .from('challenge_assignments')
+        .select('student_id, status')
+        .in('student_id', studentIds),
+      ...[...combos].map(async key => {
+        const [curriculum, grade, subject] = key.split('|');
+        topicsCache[key] = await fetchTotalTopicsFromQdrant(curriculum, grade, subject || undefined);
+      }),
+    ]);
 
     const statsMap = {};
     (stats ?? []).forEach(s => { statsMap[s.student_id] = s; });
@@ -306,10 +361,6 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
     // and gives us topic → subject so completed topics can be scoped to the teacher's subjects.
     // Also the source for quizAttempts/quizBestScore below (Activity & Performance
     // table's Quiz columns — Student Progress work-order).
-    const { data: allAttempts } = await supabase
-      .from('topic_attempts')
-      .select('student_id, topic, subject, passed, score')
-      .in('student_id', studentIds);
     const passedTopicsMap = {};
     const topicSubjectMap = {}; // student_id → { topic → subject }
     const quizStatsMap = {}; // student_id → { attempts, bestScore }
@@ -333,10 +384,6 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
     // today_minutes/today_date give today's per-subject time (reset when the date
     // rolls over) for the leaderboard's "Today" column.
     const today = todayISO();
-    const { data: subjectTimeRows } = await supabase
-      .from('student_subject_time')
-      .select('student_id, subject, minutes, today_minutes, today_date')
-      .in('student_id', studentIds);
     const subjectTimeMap = {}; // student_id → { subject → minutes }
     const subjectTimeTodayMap = {}; // student_id → { subject → minutes today }
     (subjectTimeRows ?? []).forEach(r => {
@@ -346,40 +393,13 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
       subjectTimeTodayMap[r.student_id][r.subject] = r.today_date === today ? (r.today_minutes || 0) : 0;
     });
 
-    // Pre-fetch totalTopics once per unique curriculum+grade(+subject) combo — avoids
-    // N Qdrant queries. Includes one combo per teacher-scoped subject per student.
-    const combos = new Set();
-    uniqueLinks.forEach(l => {
-      const curriculum = l.users?.curriculum ?? '';
-      const grade = l.users?.grade ?? '';
-      const subjects = teacherSubjectsByStudent[l.student_id];
-      if (subjects && subjects.size > 0) {
-        subjects.forEach(subj => combos.add(`${curriculum}|${grade}|${subj}`));
-      } else {
-        combos.add(`${curriculum}|${grade}|`);
-      }
-    });
-    const topicsCache = {};
-    await Promise.all([...combos].map(async key => {
-      const [curriculum, grade, subject] = key.split('|');
-      topicsCache[key] = await fetchTotalTopicsFromQdrant(curriculum, grade, subject || undefined);
-    }));
-
     // ── Per-student Assignments + Challenges completion (for the composite score used
     // by "needs attention" — a student should only be flagged when they're behind
     // across ALL activity streams, not just one, e.g. skipping Learning Path while
     // being highly active on assignments/challenges shouldn't trigger a flag alone).
-    const { data: subs } = await supabase
-      .from('assignment_submissions')
-      .select('student_id, assignment_id')
-      .in('student_id', studentIds);
     const submittedMap = {};
     (subs ?? []).forEach(sub => { submittedMap[sub.student_id] = (submittedMap[sub.student_id] || 0) + 1; });
 
-    const { data: teacherAssignments } = await supabase
-      .from('assignments')
-      .select('id, student_id, grade, curriculum')
-      .eq('created_by_id', teacherId ?? rawId);
     const assignedCountMap = {};
     studentIds.forEach(id => { assignedCountMap[id] = 0; });
     (teacherAssignments ?? []).forEach(a => {
@@ -395,10 +415,6 @@ router.get('/by-teacher/:teacherId', async (req, res) => {
       }
     });
 
-    const { data: challengeAssigns } = await supabase
-      .from('challenge_assignments')
-      .select('student_id, status')
-      .in('student_id', studentIds);
     const challengeMap = {};
     (challengeAssigns ?? []).forEach(c => {
       if (!challengeMap[c.student_id]) challengeMap[c.student_id] = { assigned: 0, completed: 0 };

@@ -326,3 +326,21 @@ describe('GET /student/by-teacher/:teacherId', () => {
     expect(res.body.error).toBe('connection lost');
   });
 });
+
+describe('GET /student/by-teacher/:teacherId — speed', () => {
+  test('teacher-level and per-student lookups are each sent together, not one after another', async () => {
+    mockSb.setTable('teacher_student', { data: [linkRow({ created_at: '2020-01-01T00:00:00Z' })], error: null });
+    mockSb.setTable('student_stats', { data: [{ student_id: S1, completed_topics: [] }], error: null });
+    mockSb.supabase.from.mockClear();
+
+    const res = await request(app).get(`/student/by-teacher/${TEACHER_UUID}`);
+
+    expect(res.status).toBe(200);
+    const tables = mockSb.supabase.from.mock.calls.map(c => c[0]);
+    // Round 1: links, teacher lookup and the teacher's assignments go out together.
+    expect(tables.slice(0, 3)).toEqual(['teacher_student', 'users', 'assignments']);
+    // Round 2: every per-student table back to back.
+    const i = tables.indexOf('student_stats');
+    expect(tables.slice(i, i + 5)).toEqual(['student_stats', 'topic_attempts', 'student_subject_time', 'assignment_submissions', 'challenge_assignments']);
+  });
+});
